@@ -1,49 +1,118 @@
 import { NextRequest, NextResponse } from "next/server";
-import formidable from "formidable";
-import fs from "fs";
+import { ImageModel, experimental_generateImage as generateImage } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { fireworks } from "@ai-sdk/fireworks";
+import { replicate } from "@ai-sdk/replicate";
+import { vertex } from "@ai-sdk/google-vertex/edge";
+import { ProviderKey } from "@/lib/provider-config";
+import { GenerateImageRequest } from "@/lib/api-types";
+
+/**
+ * Intended to be slightly less than the maximum execution time allowed by the
+ * runtime so that we can gracefully terminate our request.
+ */
+const TIMEOUT_MILLIS = 55 * 1000;
+
+const DEFAULT_IMAGE_SIZE = "1024x1024";
+const DEFAULT_ASPECT_RATIO = "1:1";
+
+interface ProviderConfig {
+  createImageModel: (modelId: string) => ImageModel;
+  dimensionFormat: "size" | "aspectRatio";
+}
+
+const providerConfig: Record<ProviderKey, ProviderConfig> = {
+  openai: {
+    createImageModel: openai.image,
+    dimensionFormat: "size",
+  },
+  fireworks: {
+    createImageModel: fireworks.image,
+    dimensionFormat: "aspectRatio",
+  },
+  replicate: {
+    createImageModel: replicate.image,
+    dimensionFormat: "size",
+  },
+  vertex: {
+    createImageModel: vertex.image,
+    dimensionFormat: "aspectRatio",
+  },
+};
+
+const withTimeout = <T>(
+  promise: Promise<T>,
+  timeoutMillis: number
+): Promise<T> => {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error("Request timed out")), timeoutMillis)
+    ),
+  ]);
+};
 
 export async function POST(req: NextRequest) {
-  const form = new formidable.IncomingForm();
+  const requestId = Math.random().toString(36).substring(7);
+  const { prompt, provider, modelId } =
+    (await req.json()) as GenerateImageRequest;
 
-  return new Promise((resolve, reject) => {
-    form.parse(req, async (err, fields, files) => {
-      if (err) {
-        reject(new NextResponse(JSON.stringify({ error: "Error parsing form data" }), { status: 500 }));
-        return;
+  try {
+    if (!prompt || !provider || !modelId || !providerConfig[provider]) {
+      const error = "Invalid request parameters";
+      console.error(`${error} [requestId=${requestId}]`);
+      return NextResponse.json({ error }, { status: 400 });
+    }
+
+    const config = providerConfig[provider];
+    const startstamp = performance.now();
+    const generatePromise = generateImage({
+      model: config.createImageModel(modelId),
+      prompt,
+      ...(config.dimensionFormat === "size"
+        ? { size: DEFAULT_IMAGE_SIZE }
+        : { aspectRatio: DEFAULT_ASPECT_RATIO }),
+      ...(provider !== "openai" && {
+        seed: Math.floor(Math.random() * 1000000),
+      }),
+      // Vertex AI only accepts a specified seed if watermark is disabled.
+      providerOptions: { vertex: { addWatermark: false } },
+    }).then(({ image, warnings }) => {
+      if (warnings?.length > 0) {
+        console.warn(
+          `Warnings [requestId=${requestId}, provider=${provider}, model=${modelId}]: `,
+          warnings
+        );
       }
+      console.log(
+        `Completed image request [requestId=${requestId}, provider=${provider}, model=${modelId}, elapsed=${(
+          (performance.now() - startstamp) /
+          1000
+        ).toFixed(1)}s].`
+      );
 
-      const prompt = fields.prompt?.[0] || "";
-      const imageFile = files.image?.[0];
-
-      if (!imageFile || !prompt) {
-        resolve(new NextResponse(JSON.stringify({ error: "Image and prompt are required" }), { status: 400 }));
-        return;
-      }
-
-      const imageBuffer = fs.readFileSync(imageFile.filepath);
-      const imageBase64 = imageBuffer.toString("base64");
-
-      try {
-        const response = await fetch("https://api.replicate.com/v1/predictions", {
-          method: "POST",
-          headers: {
-            "Authorization": `Token ${process.env.REPLICATE_API_TOKEN}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            version: "854e8727697a057c525cdb45ab037f64ecca770a1769cc52287c2e56472a247b",
-            input: {
-              prompt,
-              image: `data:image/png;base64,${imageBase64}`,
-            },
-          }),
-        });
-
-        const data = await response.json();
-        resolve(new NextResponse(JSON.stringify({ image_url: data.output }), { status: 200 }));
-      } catch (error) {
-        resolve(new NextResponse(JSON.stringify({ error: "Failed to generate image" }), { status: 500 }));
-      }
+      return {
+        provider,
+        image: image.base64,
+      };
     });
-  });
+
+    const result = await withTimeout(generatePromise, TIMEOUT_MILLIS);
+    return NextResponse.json(result, {
+      status: "image" in result ? 200 : 500,
+    });
+  } catch (error) {
+    // Log full error detail on the server, but return a generic error message
+    // to avoid leaking any sensitive information to the client.
+    console.error(
+      `Error generating image [requestId=${requestId}, provider=${provider}, model=${modelId}]: `,
+      error
+    );
+    return NextResponse.json(
+      {
+        error: "Failed to generate image. Please try again later.",
+      },
+      { status: 500 }
+    );
+  }
 }
